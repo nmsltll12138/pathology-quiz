@@ -1302,82 +1302,119 @@ import streamlit as st
 # quiz_data = [ {question, options, answer, explanation, (可选)chapter}, ... ]
 # =========================
 
-st.set_page_config(page_title="病理学刷题（按章节筛选）", layout="centered")
-st.title("🩺 病理学单页刷题 Web App（按章节筛选）")
+import streamlit as st
+import json
+import re
+from pathlib import Path
+
+# =========================
+# 读取 JSON 题库
+# =========================
+def load_quiz_json(path: str):
+    p = Path(path)
+    if not p.exists():
+        return []
+    return json.loads(p.read_text(encoding="utf-8"))
+
+# 你的原题库：quiz_data（你已经在上面定义好了）
+quiz_data_outline = quiz_data
+
+# 新增：PDF 全题库（含主观题）
+quiz_data_pdf_all = load_quiz_json("data/quiz_pdf_all.json")
+
+BANKS = {
+    "大纲题库": quiz_data_outline,
+    "PDF全题库（含主观题）": quiz_data_pdf_all,
+}
 
 PLACEHOLDER = "请选择一个选项…"
 
-# ---- 可选：章节名（不写也行，会只显示“第X章”）----
-CHAPTER_NAMES = {
-    1: "细胞和组织的适应与损伤",
-    2: "损伤的修复",
-    3: "局部血液循环障碍",
-    4: "炎症",
-    5: "肿瘤",
-    6: "心血管系统疾病",
-    7: "呼吸系统疾病",
-    8: "消化系统疾病",
-    9: "淋巴造血系统疾病",
-    10: "泌尿系统疾病",
-    11: "生殖系统和乳腺疾病",
-    12: "结核病/肠伤寒/细菌性痢疾",
-}
-
-def detect_chapter(item: dict):
-    """
-    优先使用 item['chapter']（最稳）。
-    如果没有 chapter，则尝试从题干中解析：【第1章】/第1章/第1章： 等。
-    解析失败返回 'unclassified'。
-    """
-    ch = item.get("chapter", None)
-    if isinstance(ch, int) and ch > 0:
+# =========================
+# 工具：章节识别（兼容 int / str / 从题干解析）
+# =========================
+def get_chapter(item: dict):
+    # 优先使用字段
+    ch = item.get("chapter")
+    if ch is not None and str(ch).strip() != "":
         return ch
 
-    q = str(item.get("question", ""))
-    m = re.search(r"第\s*(\d+)\s*章", q)  # 能匹配 【第1章】、第1章：、第1章 等
+    # 兜底：从题干前缀解析 【第X章】
+    q = item.get("question", "")
+    m = re.search(r"【\s*第\s*(\d+)\s*章\s*】", q)
     if m:
         return int(m.group(1))
+    return "未分章"
 
-    return "unclassified"
+def build_chapter_options(data):
+    # 保持“出现顺序”，同时把数字章节排在前面
+    seen = {}
+    order = []
+    for i, it in enumerate(data):
+        ch = get_chapter(it)
+        if ch not in seen:
+            seen[ch] = len(order)
+            order.append(ch)
 
-def chapter_label(ch):
-    if ch is None:
-        return f"全部（{len(quiz_data)}题）"
-    if ch == "unclassified":
-        return "未分章"
-    name = CHAPTER_NAMES.get(ch, "")
-    return f"第{ch}章 {name}".strip()
+    numeric = sorted([c for c in order if isinstance(c, int)])
+    others = [c for c in order if not isinstance(c, int)]
 
-# -------------------------
-# 题库空保护
-# -------------------------
-if "quiz_data" not in globals() or not isinstance(quiz_data, list) or len(quiz_data) == 0:
-    st.error("检测到 quiz_data 为空或未定义。请确认 quiz_data = [...] 在本 UI 代码之前，并且列表里有题目。")
-    st.stop()
+    # 用“字符串 label”做下拉，避免你截图里出现的空白显示问题
+    labels = ["全部"]
+    label_to_key = {"全部": None}
 
-# -------------------------
-# 建立：章节 -> 题目索引
-# -------------------------
-chapter_to_indices = {}
-for i, item in enumerate(quiz_data):
-    ch = detect_chapter(item)
-    chapter_to_indices.setdefault(ch, []).append(i)
+    for c in numeric:
+        lab = f"第{c}章"
+        labels.append(lab)
+        label_to_key[lab] = c
 
-# 章节列表：数字章 + 未分章（如果存在）
-numeric_chapters = sorted([c for c in chapter_to_indices.keys() if isinstance(c, int)])
-chapters = [None] + numeric_chapters
-if "unclassified" in chapter_to_indices:
-    chapters.append("unclassified")
+    for c in others:
+        lab = str(c)
+        labels.append(lab)
+        label_to_key[lab] = c
 
-def chapter_display(ch):
-    if ch is None:
-        return chapter_label(None)
-    cnt = len(chapter_to_indices.get(ch, []))
-    return f"{chapter_label(ch)}（{cnt}题）"
+    return labels, label_to_key
 
 # =========================
-# session_state 初始化（严格要求的三个关键字段）
+# 工具：主观题粗略判定（更宽松一些）
 # =========================
+def normalize_text(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("；", ";").replace("，", ",").replace("。", "").replace("、", ",")
+    s = s.replace("（", "(").replace("）", ")")
+    return s
+
+def grade_subjective(user: str, answer: str):
+    # 没有标准答案就不判分
+    if not answer or "暂无" in answer:
+        return None
+
+    u = normalize_text(user)
+    a = normalize_text(answer)
+    if not u:
+        return False
+
+    # 完全一致
+    if u == a:
+        return True
+
+    # 关键词覆盖（把答案按分隔符拆开，80% 出现在用户输入里判正确）
+    parts = [p.strip() for p in re.split(r"[;,\s]+", answer) if p.strip()]
+    parts = [p for p in parts if len(p) >= 2 and "暂无" not in p]
+    if parts:
+        hit = sum(1 for p in parts if normalize_text(p) and normalize_text(p) in u)
+        if hit / len(parts) >= 0.8:
+            return True
+
+    return False
+
+# =========================
+# Streamlit 单页应用
+# =========================
+st.set_page_config(page_title="病理学刷题（单页）", layout="centered")
+st.title("🩺 病理学单页刷题 Web App（题库/章节筛选）")
+
+# session_state 基础字段（必须）
 if "current_index" not in st.session_state:
     st.session_state.current_index = 0
 if "score" not in st.session_state:
@@ -1387,156 +1424,204 @@ if "submitted" not in st.session_state:
 if "last_is_correct" not in st.session_state:
     st.session_state.last_is_correct = None
 
-# 每章单独保存进度（切章不丢）
-if "chapter_states" not in st.session_state:
-    st.session_state.chapter_states = {}   # key: chapter -> {current_index, score, submitted, last_is_correct}
-if "active_chapter" not in st.session_state:
-    st.session_state.active_chapter = None
+# 为“不同题库+不同章节”保存独立进度
+if "progress_map" not in st.session_state:
+    st.session_state.progress_map = {}
+if "active_state_key" not in st.session_state:
+    st.session_state.active_state_key = None
 
-def reset_state():
-    st.session_state.current_index = 0
-    st.session_state.score = 0
-    st.session_state.submitted = False
-    st.session_state.last_is_correct = None
+# ---- 侧边栏：题库选择
+st.sidebar.header("📚 题库选择")
+bank_name = st.sidebar.selectbox("选择题库", list(BANKS.keys()))
+active_quiz = BANKS[bank_name]
 
-# =========================
-# 侧边栏：章节筛选
-# =========================
+# ---- 侧边栏：章节筛选
 st.sidebar.header("📚 章节筛选")
+labels, label_to_key = build_chapter_options(active_quiz)
+chosen_label = st.sidebar.selectbox("选择章节", labels)
+chosen_chapter = label_to_key[chosen_label]
 
-chosen_chapter = st.sidebar.selectbox(
-    "选择章节",
-    options=chapters,
-    format_func=chapter_display,
-)
+# 构建当前章节题目索引列表
+filtered_indices = []
+for idx, it in enumerate(active_quiz):
+    if chosen_chapter is None:
+        filtered_indices.append(idx)
+    else:
+        if get_chapter(it) == chosen_chapter:
+            filtered_indices.append(idx)
 
-# 切换章节：先存旧章状态，再载入新章状态
-if chosen_chapter != st.session_state.active_chapter:
-    # 保存旧章
-    st.session_state.chapter_states[st.session_state.active_chapter] = {
+total = len(filtered_indices)
+
+# 当前“题库+章节”的状态 key
+state_key = f"{bank_name}::{str(chosen_chapter)}"
+
+def save_current_state():
+    st.session_state.progress_map[state_key] = {
         "current_index": st.session_state.current_index,
         "score": st.session_state.score,
         "submitted": st.session_state.submitted,
         "last_is_correct": st.session_state.last_is_correct,
     }
 
-    # 载入新章
-    new_state = st.session_state.chapter_states.get(chosen_chapter)
-    if new_state is None:
-        reset_state()
-    else:
-        st.session_state.current_index = new_state.get("current_index", 0)
-        st.session_state.score = new_state.get("score", 0)
-        st.session_state.submitted = new_state.get("submitted", False)
-        st.session_state.last_is_correct = new_state.get("last_is_correct", None)
-
-    st.session_state.active_chapter = chosen_chapter
-    st.rerun()
-
-# 本章题目索引列表
-filtered_indices = list(range(len(quiz_data))) if chosen_chapter is None else chapter_to_indices.get(chosen_chapter, [])
-total = len(filtered_indices)
-
-# 侧边栏信息
-st.sidebar.markdown("---")
-st.sidebar.write(f"当前章节题量：**{total}**")
-st.sidebar.write(f"当前得分：**{st.session_state.score}**")
-st.sidebar.write(f"当前进度：**{min(st.session_state.current_index, total)}/{total}**")
-
-if st.sidebar.button("🔄 重置本章进度"):
-    reset_state()
-    st.session_state.chapter_states[chosen_chapter] = {
-        "current_index": 0,
-        "score": 0,
-        "submitted": False,
-        "last_is_correct": None,
-    }
-    st.rerun()
-
-# 章节空保护（理论上不会再空；除非 quiz_data 真空）
-if total == 0:
-    st.warning("该章节暂无题目（请检查 quiz_data 是否为空，或题目是否缺少 chapter/题干中缺少“第X章”字样）。")
-    st.stop()
-
-# =========================
-# 结算页
-# =========================
-if st.session_state.current_index >= total:
-    st.success(f"✅ 本章完成！总分：{st.session_state.score} / {total}")
-    st.progress(1.0)
-
-    if st.button("🔄 重新开始（本章）", type="primary"):
-        reset_state()
-        st.session_state.chapter_states[chosen_chapter] = {
-            "current_index": 0,
-            "score": 0,
-            "submitted": False,
-            "last_is_correct": None,
-        }
-        st.rerun()
-
-    st.stop()
-
-# =========================
-# 正常刷题页
-# =========================
-done = st.session_state.current_index
-st.progress(done / total)
-st.caption(f"进度：已完成 {done}/{total} 题｜当前得分：{st.session_state.score}")
-
-global_idx = filtered_indices[st.session_state.current_index]
-q = quiz_data[global_idx]
-
-st.subheader(f"第 {st.session_state.current_index + 1} / {total} 题")
-st.write(q["question"])
-
-ui_options = [PLACEHOLDER] + q["options"]
-
-# ✅ 关键：每一题一个 radio key，避免 “selected_option cannot be modified” 报错
-radio_key = f"selected_{chosen_chapter}_{st.session_state.current_index}"
-selected = st.radio(
-    "请选择：",
-    ui_options,
-    key=radio_key,
-    disabled=st.session_state.submitted,
-)
-
-submit_clicked = st.button("✅ 提交答案", type="primary", disabled=st.session_state.submitted)
-
-if submit_clicked:
-    if selected == PLACEHOLDER:
-        st.warning("请先选择一个选项再提交。")
-    else:
-        st.session_state.submitted = True
-        is_correct = (selected == q["answer"])
-        st.session_state.last_is_correct = is_correct
-        if is_correct:
-            st.session_state.score += 1
-
-# 提交后反馈 + 解析 + 下一题
-if st.session_state.submitted:
-    if st.session_state.last_is_correct:
-        st.success("回答正确 ✅")
-    else:
-        st.error(f"回答错误 ❌，正确答案是：{q['answer']}")
-
-    with st.expander("📌 解析（自动展开）", expanded=True):
-        st.info(q["explanation"])
-
-    if st.button("➡️ 下一题"):
-        st.session_state.current_index += 1
+def load_state_for_key():
+    data = st.session_state.progress_map.get(state_key, None)
+    if data is None:
+        st.session_state.current_index = 0
+        st.session_state.score = 0
         st.session_state.submitted = False
         st.session_state.last_is_correct = None
+    else:
+        st.session_state.current_index = data.get("current_index", 0)
+        st.session_state.score = data.get("score", 0)
+        st.session_state.submitted = data.get("submitted", False)
+        st.session_state.last_is_correct = data.get("last_is_correct", None)
 
-        # 同步保存当前章节进度（稳）
-        st.session_state.chapter_states[chosen_chapter] = {
+# 如果切换了题库/章节，先保存旧状态，再加载新状态
+if st.session_state.active_state_key != state_key:
+    if st.session_state.active_state_key is not None:
+        # 保存旧key的状态
+        old_key = st.session_state.active_state_key
+        st.session_state.progress_map[old_key] = {
             "current_index": st.session_state.current_index,
             "score": st.session_state.score,
             "submitted": st.session_state.submitted,
             "last_is_correct": st.session_state.last_is_correct,
         }
+    load_state_for_key()
+    st.session_state.active_state_key = state_key
+
+# 侧边栏显示信息 & 重置按钮
+st.sidebar.markdown("---")
+st.sidebar.write(f"当前章节题量：**{total}**")
+st.sidebar.write(f"当前得分：**{st.session_state.score}**")
+st.sidebar.write(f"当前进度：**{min(st.session_state.current_index, total)}/{total}**")
+
+if st.sidebar.button("🔄 重置本题库/章节进度"):
+    st.session_state.progress_map[state_key] = {
+        "current_index": 0, "score": 0, "submitted": False, "last_is_correct": None
+    }
+    load_state_for_key()
+    st.session_state.active_state_key = state_key
+    st.rerun()
+
+# 如果本章节没题
+if total == 0:
+    st.warning("该筛选条件下暂无题目。请在左侧切换题库/章节。")
+    st.stop()
+
+# 进度条
+progress = st.session_state.current_index / total if total else 0
+st.progress(progress)
+
+# 结算页
+if st.session_state.current_index >= total:
+    st.success(f"✅ 本章节已完成！总分：{st.session_state.score} / {total}")
+    st.progress(1.0)
+    if st.button("🔄 重新开始（本章节）", type="primary"):
+        st.session_state.current_index = 0
+        st.session_state.score = 0
+        st.session_state.submitted = False
+        st.session_state.last_is_correct = None
+        save_current_state()
+        st.rerun()
+    st.stop()
+
+# 当前题
+pos = st.session_state.current_index
+global_idx = filtered_indices[pos]
+q = active_quiz[global_idx]
+
+qtype = q.get("qtype")
+if not qtype:
+    qtype = "单选题" if q.get("options") else "简答题"
+
+st.subheader(f"第 {pos+1} / {total} 题")
+st.caption(f"题型：{qtype}")
+st.write(q["question"])
+
+# 为每道题生成独立 widget key，避免 selected_option 修改报错
+widget_key = f"ans::{bank_name}::{global_idx}"
+disabled = bool(st.session_state.submitted)
+
+user_answer = None
+
+if qtype == "单选题":
+    options = [PLACEHOLDER] + (q.get("options") or [])
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = PLACEHOLDER
+
+    user_answer = st.radio(
+        "请选择一个选项：",
+        options=options,
+        index=options.index(st.session_state[widget_key]) if st.session_state[widget_key] in options else 0,
+        key=widget_key,
+        disabled=disabled,
+    )
+
+else:
+    # 主观题
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = ""
+
+    if qtype in ("填空题", "名词解释"):
+        user_answer = st.text_input("请输入你的答案：", key=widget_key, disabled=disabled)
+    else:
+        user_answer = st.text_area("请输入你的答案：", key=widget_key, height=120, disabled=disabled)
+
+# 提交按钮
+if not st.session_state.submitted:
+    if st.button("✅ 提交答案", type="primary"):
+        correct = None
+
+        # 判分
+        if qtype == "单选题":
+            if user_answer == PLACEHOLDER:
+                st.warning("请先选择一个选项再提交。")
+                st.stop()
+
+            if not q.get("answer"):  # 没有标准答案
+                correct = None
+            else:
+                correct = (user_answer == q["answer"])
+
+        else:
+            correct = grade_subjective(user_answer, q.get("answer", ""))
+
+        st.session_state.submitted = True
+        st.session_state.last_is_correct = correct
+
+        if correct is True:
+            st.session_state.score += 1
+
+        save_current_state()
+        st.rerun()
+
+# 提交后反馈 + 解析 + 下一题
+if st.session_state.submitted:
+    correct = st.session_state.last_is_correct
+
+    if correct is True:
+        st.success("回答正确 ✅")
+    elif correct is False:
+        # 单选显示正确答案
+        if qtype == "单选题":
+            st.error(f"回答错误 ❌，正确答案是：{q.get('answer','（暂无答案）')}")
+        else:
+            st.error("未匹配到标准答案（主观题为粗略判定，仅供自查）❌")
+    else:
+        st.warning("本题暂无可自动判定的标准答案，未计分。")
+
+    with st.expander("📌 查看解析 / 参考答案", expanded=True):
+        st.info(q.get("explanation", "（暂无解析）"))
+
+    if st.button("➡️ 下一题"):
+        st.session_state.current_index += 1
+        st.session_state.submitted = False
+        st.session_state.last_is_correct = None
+        save_current_state()
         st.rerun()
 
 st.divider()
 st.caption("钱靖 • 病理学刷题。")
+
 
