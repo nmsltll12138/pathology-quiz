@@ -1538,4 +1538,5 @@ if st.session_state.submitted:
         st.rerun()
 
 st.divider()
-st.caption("提示：建议在 quiz_data 的每题里加 chapter 字段（例如 1~12），章节筛选会更稳定。")
+st.caption("钱靖 • 病理学刷题。")
+
