@@ -5,7 +5,18 @@ import streamlit as st
 # 每道题：question / options / answer / explanation
 # 每章 15 题（共 12 章 * 15 = 180 题）
 # =========================
-quiz_data = []
+import json
+from pathlib import Path
+import streamlit as st
+
+@st.cache_data
+def load_quiz():
+    p = Path(__file__).parent / "data" / "quiz_all_courses.json"
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+quiz_data = load_quiz()
+
 
 # -------------------------
 # 第1章 细胞和组织的适应与损伤（15）
@@ -1432,28 +1443,62 @@ if "active_state_key" not in st.session_state:
 
 # ---- 侧边栏：题库选择
 st.sidebar.header("📚 题库选择")
-bank_name = st.sidebar.selectbox("选择题库", list(BANKS.keys()))
+bank_name = st.sidebar.selectbox("选择题库", list(BANKS.keys()), key="bank_sel")
 active_quiz = BANKS[bank_name]
 
-# ---- 侧边栏：章节筛选
+# 给题目一个“兜底题型”，避免没有 qtype 的题筛选不到
+def resolve_qtype(item: dict) -> str:
+    qt = item.get("qtype")
+    if qt:
+        return qt
+    return "单选题" if item.get("options") else "简答题"
+
+# ---- 侧边栏：课程筛选（如果题库里没 course 字段，也能用）
+st.sidebar.header("📚 课程筛选")
+courses = sorted({q.get("course", "未分类") for q in active_quiz})
+selected_course = st.sidebar.selectbox("选择课程", ["全部"] + courses, key="course_sel")
+
+# 先按课程过滤一遍，用于生成章节下拉
+quiz_after_course = [
+    q for q in active_quiz
+    if selected_course == "全部" or q.get("course", "未分类") == selected_course
+]
+
+# ---- 侧边栏：章节筛选（沿用你原来的 build_chapter_options / get_chapter）
 st.sidebar.header("📚 章节筛选")
-labels, label_to_key = build_chapter_options(active_quiz)
-chosen_label = st.sidebar.selectbox("选择章节", labels)
+labels, label_to_key = build_chapter_options(quiz_after_course)
+chosen_label = st.sidebar.selectbox("选择章节", labels, key="chapter_sel")
 chosen_chapter = label_to_key[chosen_label]
 
-# 构建当前章节题目索引列表
+# 再按课程+章节过滤，用于生成题型下拉
+quiz_after_chapter = [
+    q for q in quiz_after_course
+    if chosen_chapter is None or get_chapter(q) == chosen_chapter
+]
+
+# ---- 侧边栏：题型筛选
+st.sidebar.header("🧩 题型筛选")
+qtypes = sorted({resolve_qtype(q) for q in quiz_after_chapter})
+selected_qtype = st.sidebar.selectbox("选择题型", ["全部"] + qtypes, key="qtype_sel")
+
+# 构建当前筛选后的题目索引列表（索引仍然基于 active_quiz）
 filtered_indices = []
 for idx, it in enumerate(active_quiz):
-    if chosen_chapter is None:
-        filtered_indices.append(idx)
-    else:
-        if get_chapter(it) == chosen_chapter:
-            filtered_indices.append(idx)
+    if selected_course != "全部" and it.get("course", "未分类") != selected_course:
+        continue
+    if chosen_chapter is not None and get_chapter(it) != chosen_chapter:
+        continue
+    if selected_qtype != "全部" and resolve_qtype(it) != selected_qtype:
+        continue
+    filtered_indices.append(idx)
 
 total = len(filtered_indices)
 
-# 当前“题库+章节”的状态 key
-state_key = f"{bank_name}::{str(chosen_chapter)}"
+# 当前“题库+课程+章节+题型”的状态 key（用于保存进度）
+state_key = f"{bank_name}::{selected_course}::{str(chosen_chapter)}::{selected_qtype}"
+
+
+
 
 def save_current_state():
     st.session_state.progress_map[state_key] = {
@@ -1531,9 +1576,7 @@ pos = st.session_state.current_index
 global_idx = filtered_indices[pos]
 q = active_quiz[global_idx]
 
-qtype = q.get("qtype")
-if not qtype:
-    qtype = "单选题" if q.get("options") else "简答题"
+qtype = resolve_qtype(q)  # 用上面侧边栏里定义的 resolve_qtype
 
 st.subheader(f"第 {pos+1} / {total} 题")
 st.caption(f"题型：{qtype}")
@@ -1558,6 +1601,18 @@ if qtype == "单选题":
         disabled=disabled,
     )
 
+elif qtype == "多选题":
+    options = q.get("options") or []
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = []  # 多选默认空列表
+
+    user_answer = st.multiselect(
+        "请选择一个或多个选项：",
+        options=options,
+        key=widget_key,
+        disabled=disabled,
+    )
+
 else:
     # 主观题
     if widget_key not in st.session_state:
@@ -1574,18 +1629,37 @@ if not st.session_state.submitted:
         correct = None
 
         # 判分
-        if qtype == "单选题":
-            if user_answer == PLACEHOLDER:
-                st.warning("请先选择一个选项再提交。")
-                st.stop()
+if qtype == "单选题":
+    if user_answer == PLACEHOLDER:
+        st.warning("请先选择一个选项再提交。")
+        st.stop()
 
-            if not q.get("answer"):  # 没有标准答案
-                correct = None
-            else:
-                correct = (user_answer == q["answer"])
+    if not q.get("answer"):
+        correct = None
+    else:
+        correct = (user_answer == q["answer"])
 
+elif qtype == "多选题":
+    # user_answer 是 list[str]
+    if not user_answer:
+        st.warning("请至少选择一个选项再提交。")
+        st.stop()
+
+    ans = q.get("answer")
+    # 题库里建议 answer 为 list[str]（正确选项“文本”列表）
+    if isinstance(ans, list):
+        correct = (set(user_answer) == set(ans))
+    else:
+        # 如果 answer 是字符串，尝试按分隔符拆成列表（兜底）
+        if isinstance(ans, str) and ans.strip():
+            parts = [p.strip() for p in re.split(r"[;,，、\s]+", ans) if p.strip()]
+            correct = (set(user_answer) == set(parts))
         else:
-            correct = grade_subjective(user_answer, q.get("answer", ""))
+            correct = None
+
+else:
+    correct = grade_subjective(user_answer, q.get("answer", ""))
+
 
         st.session_state.submitted = True
         st.session_state.last_is_correct = correct
@@ -1605,9 +1679,12 @@ if st.session_state.submitted:
     elif correct is False:
         # 单选显示正确答案
         if qtype == "单选题":
-            st.error(f"回答错误 ❌，正确答案是：{q.get('answer','（暂无答案）')}")
-        else:
-            st.error("未匹配到标准答案（主观题为粗略判定，仅供自查）❌")
+    st.error(f"回答错误 ❌，正确答案是：{q.get('answer','（暂无答案）')}")
+elif qtype == "多选题":
+    st.error(f"回答错误 ❌，正确答案是：{q.get('answer','（暂无答案）')}")
+else:
+    st.error("未匹配到标准答案（主观题为粗略判定，仅供自查）❌")
+
     else:
         st.warning("本题暂无可自动判定的标准答案，未计分。")
 
@@ -1623,5 +1700,6 @@ if st.session_state.submitted:
 
 st.divider()
 st.caption("钱靖 • 病理学刷题。")
+
 
 
