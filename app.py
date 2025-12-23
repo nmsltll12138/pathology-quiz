@@ -1675,14 +1675,15 @@ if st.session_state.submitted:
 
     if correct is True:
         st.success("回答正确 ✅")
+
     elif correct is False:
-        # 单选显示正确答案
+        # 单选/多选显示正确答案；主观题给提示
         if qtype == "单选题":
-    st.error(f"回答错误 ❌，正确答案是：{q.get('answer','（暂无答案）')}")
-elif qtype == "多选题":
-    st.error(f"回答错误 ❌，正确答案是：{q.get('answer','（暂无答案）')}")
-else:
-    st.error("未匹配到标准答案（主观题为粗略判定，仅供自查）❌")
+            st.error(f"回答错误 ❌，正确答案是：{q.get('answer','（暂无答案）')}")
+        elif qtype == "多选题":
+            st.error(f"回答错误 ❌，正确答案是：{q.get('answer','（暂无答案）')}")
+        else:
+            st.error("未匹配到标准答案（主观题为粗略判定，仅供自查）❌")
 
     else:
         st.warning("本题暂无可自动判定的标准答案，未计分。")
@@ -1697,8 +1698,11 @@ else:
         save_current_state()
         st.rerun()
 
+
+
 st.divider()
 st.caption("钱靖 • 病理学刷题。")
+
 
 
 
