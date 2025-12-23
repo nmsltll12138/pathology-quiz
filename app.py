@@ -1660,15 +1660,14 @@ elif qtype == "多选题":
 else:
     correct = grade_subjective(user_answer, q.get("answer", ""))
 
+st.session_state.submitted = True
+st.session_state.last_is_correct = correct
 
-        st.session_state.submitted = True
-        st.session_state.last_is_correct = correct
+if correct is True:
+    st.session_state.score += 1
 
-        if correct is True:
-            st.session_state.score += 1
-
-        save_current_state()
-        st.rerun()
+save_current_state()
+st.rerun()
 
 # 提交后反馈 + 解析 + 下一题
 if st.session_state.submitted:
@@ -1700,6 +1699,7 @@ else:
 
 st.divider()
 st.caption("钱靖 • 病理学刷题。")
+
 
 
 
