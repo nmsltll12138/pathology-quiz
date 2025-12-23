@@ -1,136 +1,171 @@
 import json
+import difflib
 import re
 from pathlib import Path
-
 import streamlit as st
 
+# =========================
+# 常量
+# =========================
+PLACEHOLDER = "请选择一个选项…"
 
 # =========================
-# Config
+# 读取题库（把题库放到 data/*.json）
+# 每题建议字段：
+# course, chapter, qtype, question, options, answer, explanation
 # =========================
-st.set_page_config(page_title="刷题 Web App", layout="centered")
-
-
-# =========================
-# Load quiz bank (NO questions inside app.py)
-# =========================
-@st.cache_data
-def load_quiz_data():
-    base = Path(__file__).parent
-    data_dir = base / "data"
-    files = sorted(data_dir.glob("quiz_*.json"))
-
+@st.cache_data(show_spinner=False)
+def load_all_quiz():
+    data_dir = Path(__file__).parent / "data"
     if not data_dir.exists():
-        raise FileNotFoundError("未找到 data/ 文件夹。请在仓库根目录创建 data/ 并上传 quiz_*.json 题库文件。")
-    if not files:
-        raise FileNotFoundError("data/ 下未找到 quiz_*.json 题库文件。请上传题库 JSON。")
+        raise FileNotFoundError(f"未找到 data 目录：{data_dir}")
 
-    all_q = []
-    for f in files:
-        try:
-            items = json.loads(f.read_text(encoding="utf-8"))
-            if not isinstance(items, list):
-                continue
-            # 记录来源文件名，方便排查
-            for it in items:
-                if isinstance(it, dict):
-                    it.setdefault("_source", f.name)
-                    all_q.append(it)
-        except Exception:
-            # 某个 JSON 格式坏了，不让全站崩；同时给提示
-            all_q.append({
-                "course": "题库错误",
-                "chapter": "请检查 JSON",
-                "qtype": "单选题",
-                "question": f"题库文件 {f.name} 无法解析（JSON 格式错误）。",
-                "options": ["请修复该 JSON 文件后重试。"],
-                "answer": "请修复该 JSON 文件后重试。",
-                "explanation": "请检查逗号、引号、括号是否完整；确保整个文件是一个 list[dict]。",
-                "_source": f.name,
-            })
-
-    return all_q
+    all_items = []
+    for p in sorted(data_dir.glob("*.json")):
+        with open(p, "r", encoding="utf-8") as f:
+            arr = json.load(f)
+        if isinstance(arr, dict):
+            # 兼容：如果某些导出是 {"data": [...]}
+            arr = arr.get("data", [])
+        if not isinstance(arr, list):
+            continue
+        for it in arr:
+            if isinstance(it, dict):
+                it["_src_file"] = p.name
+                all_items.append(it)
+    if not all_items:
+        raise FileNotFoundError("data 目录下没有可用的题库 JSON（*.json）")
+    return all_items
 
 
-quiz_data = load_quiz_data()
+def get_course(it: dict) -> str:
+    return (it.get("course") or "").strip() or "未命名课程"
 
 
-# =========================
-# Helpers
-# =========================
-def resolve_course(q: dict) -> str:
-    return str(q.get("course", "未分类")).strip() or "未分类"
+def get_chapter(it: dict) -> str:
+    ch = (it.get("chapter") or "").strip()
+    return ch or "未分章"
 
 
-def resolve_chapter(q: dict) -> str:
-    ch = q.get("chapter", None)
-    if ch is not None and str(ch).strip():
-        return str(ch).strip()
-
-    # 兜底：从题干解析【第X章】
-    text = str(q.get("question", ""))
-    m = re.search(r"【\s*第\s*(\d+)\s*章\s*】", text)
-    if m:
-        return f"第{m.group(1)}章"
-    return "未分章"
-
-
-def resolve_qtype(q: dict) -> str:
-    qt = q.get("qtype")
-    if qt and str(qt).strip():
-        return str(qt).strip()
-
-    # 兜底：有 options 视作选择题，否则简答
-    opts = q.get("options") or []
-    return "单选题" if opts else "简答题"
+def infer_qtype(it: dict) -> str:
+    qt = (it.get("qtype") or "").strip()
+    if qt:
+        return qt
+    opts = it.get("options") or []
+    ans = it.get("answer")
+    if opts and isinstance(ans, list):
+        return "多选题"
+    if opts:
+        return "单选题"
+    return "简答题"
 
 
-def normalize_text(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", "", s)
-    s = s.replace("；", ";").replace("，", ",").replace("。", "")
-    s = s.replace("（", "(").replace("）", ")")
-    return s
+def normalize_text(x) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
 
 
-def grade_subjective(user: str, answer: str):
-    """主观题：仅做非常宽松的自测判定；无答案则返回 None（不计分）。"""
-    if not answer or "暂无" in str(answer):
+def grade_subjective(user: str, standard: str) -> bool | None:
+    """主观题：非常粗略的相似度判分，仅供自查。"""
+    user = normalize_text(user)
+    standard = normalize_text(standard)
+    if not standard:
         return None
-
-    u = normalize_text(user)
-    a = normalize_text(str(answer))
-    if not u:
+    if not user:
         return False
-    if u == a:
-        return True
+    ratio = difflib.SequenceMatcher(None, user, standard).ratio()
+    return ratio >= 0.65
 
-    # 关键词覆盖（答案按分隔符拆分，命中 >=80% 认为正确）
-    raw = str(answer)
-    parts = [p.strip() for p in re.split(r"[;,\s，、]+", raw) if p.strip()]
-    parts = [p for p in parts if len(p) >= 2 and "暂无" not in p]
-    if parts:
-        hit = sum(1 for p in parts if normalize_text(p) in u)
-        if hit / len(parts) >= 0.8:
-            return True
-    return False
+
+def ensure_list(x):
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return [normalize_text(i) for i in x if normalize_text(i)]
+    # 兼容：字符串 "ABD" 或 "A,B,D"
+    s = normalize_text(x)
+    # 如果看起来像字母答案，先按字母拆
+    if all(c in "ABCDEFGH" for c in s.replace(",", "").replace(" ", "").upper()) and len(s) <= 10:
+        letters = [c for c in s.upper() if c in "ABCDEFGH"]
+        return letters
+    # 否则按分隔符拆
+    parts = [p.strip() for p in re.split(r"[，,、;\s]+", s) if p.strip()]
+    return parts
 
 
 # =========================
-# Session State (critical)
+# Streamlit 单页应用
 # =========================
-def init_state():
-    st.session_state.setdefault("current_index", 0)
-    st.session_state.setdefault("score", 0)
-    st.session_state.setdefault("submitted", False)
-    st.session_state.setdefault("last_is_correct", None)
+st.set_page_config(page_title="刷题系统（课程/章节筛选）", layout="centered")
+st.title("🩺 刷题 Web App（课程/章节筛选 + 单选/多选/简答）")
 
-    # 按筛选维度保存进度（防刷新/切换丢失）
-    st.session_state.setdefault("progress_map", {})
-    st.session_state.setdefault("active_state_key", None)
+# ---- 先加载题库
+try:
+    all_quiz = load_all_quiz()
+except Exception as e:
+    st.error(f"题库加载失败：{e}")
+    st.info("请确认仓库中存在 data 目录，且 data/*.json 已上传并提交到 GitHub。")
+    st.stop()
+
+# ---- 按课程分组
+COURSE_MAP = {}
+for it in all_quiz:
+    COURSE_MAP.setdefault(get_course(it), []).append(it)
+
+courses = sorted(COURSE_MAP.keys())
+
+# =========================
+# session_state（防刷新丢进度）
+# =========================
+if "current_index" not in st.session_state:
+    st.session_state.current_index = 0
+if "score" not in st.session_state:
+    st.session_state.score = 0
+if "submitted" not in st.session_state:
+    st.session_state.submitted = False
+if "last_is_correct" not in st.session_state:
+    st.session_state.last_is_correct = None
+
+# 为“不同课程+不同章节”保存独立进度
+if "progress_map" not in st.session_state:
+    st.session_state.progress_map = {}
+if "active_state_key" not in st.session_state:
+    st.session_state.active_state_key = None
+
+# =========================
+# 侧边栏：课程 / 章节 / 题型 筛选
+# =========================
+st.sidebar.header("📚 课程 / 章节 筛选")
+
+course_name = st.sidebar.selectbox("选择课程", courses)
+active_quiz = COURSE_MAP[course_name]
+
+chapters = sorted({get_chapter(it) for it in active_quiz})
+chapter_labels = ["全部"] + chapters
+chosen_chapter = st.sidebar.selectbox("选择章节", chapter_labels)
+
+qtype_labels = ["全部", "单选题", "多选题", "简答题"]
+chosen_qtype = st.sidebar.selectbox("题型筛选", qtype_labels)
 
 
-def save_state(state_key: str):
+def passes_filter(it: dict) -> bool:
+    if chosen_chapter != "全部" and get_chapter(it) != chosen_chapter:
+        return False
+    qt = infer_qtype(it)
+    if chosen_qtype != "全部" and qt != chosen_qtype:
+        return False
+    return True
+
+
+filtered_indices = [idx for idx, it in enumerate(active_quiz) if passes_filter(it)]
+total = len(filtered_indices)
+
+# 当前筛选状态 key（决定“独立进度”）
+state_key = f"{course_name}::{chosen_chapter}::{chosen_qtype}"
+
+
+def save_current_state():
     st.session_state.progress_map[state_key] = {
         "current_index": st.session_state.current_index,
         "score": st.session_state.score,
@@ -139,7 +174,7 @@ def save_state(state_key: str):
     }
 
 
-def load_state(state_key: str):
+def load_state_for_key():
     data = st.session_state.progress_map.get(state_key)
     if not data:
         st.session_state.current_index = 0
@@ -147,196 +182,161 @@ def load_state(state_key: str):
         st.session_state.submitted = False
         st.session_state.last_is_correct = None
     else:
-        st.session_state.current_index = data.get("current_index", 0)
-        st.session_state.score = data.get("score", 0)
-        st.session_state.submitted = data.get("submitted", False)
+        st.session_state.current_index = int(data.get("current_index", 0))
+        st.session_state.score = int(data.get("score", 0))
+        st.session_state.submitted = bool(data.get("submitted", False))
         st.session_state.last_is_correct = data.get("last_is_correct", None)
 
 
-init_state()
-
-
-# =========================
-# UI: Sidebar filters
-# =========================
-st.title("🧠 单页刷题 Web App（JSON题库版）")
-
-st.sidebar.header("📚 筛选")
-
-all_courses = sorted({resolve_course(q) for q in quiz_data})
-selected_course = st.sidebar.selectbox("选择课程", ["全部"] + all_courses, key="course_sel")
-
-# chapters depend on course
-chapters = sorted({
-    resolve_chapter(q)
-    for q in quiz_data
-    if selected_course == "全部" or resolve_course(q) == selected_course
-})
-selected_chapter = st.sidebar.selectbox("选择章节", ["全部"] + chapters, key="chapter_sel")
-
-# qtypes depend on course+chapter
-qtypes = sorted({
-    resolve_qtype(q)
-    for q in quiz_data
-    if (selected_course == "全部" or resolve_course(q) == selected_course)
-    and (selected_chapter == "全部" or resolve_chapter(q) == selected_chapter)
-})
-selected_qtype = st.sidebar.selectbox("选择题型", ["全部"] + qtypes, key="qtype_sel")
-
-# Filtered list
-filtered = [
-    q for q in quiz_data
-    if (selected_course == "全部" or resolve_course(q) == selected_course)
-    and (selected_chapter == "全部" or resolve_chapter(q) == selected_chapter)
-    and (selected_qtype == "全部" or resolve_qtype(q) == selected_qtype)
-]
-
-total = len(filtered)
-
-# state key depends on filters (so each filter set has its own progress)
-state_key = f"{selected_course}::{selected_chapter}::{selected_qtype}"
-
-# if switching filter set, save old and load new
+# 如果切换了筛选条件：保存旧状态 → 载入新状态
 if st.session_state.active_state_key != state_key:
     if st.session_state.active_state_key is not None:
-        save_state(st.session_state.active_state_key)
-    load_state(state_key)
+        old_key = st.session_state.active_state_key
+        st.session_state.progress_map[old_key] = {
+            "current_index": st.session_state.current_index,
+            "score": st.session_state.score,
+            "submitted": st.session_state.submitted,
+            "last_is_correct": st.session_state.last_is_correct,
+        }
+    load_state_for_key()
     st.session_state.active_state_key = state_key
 
+# ---- 侧边栏：信息与重置
 st.sidebar.markdown("---")
-st.sidebar.write(f"筛选后题量：**{total}**")
+st.sidebar.write(f"当前题量：**{total}**")
 st.sidebar.write(f"当前得分：**{st.session_state.score}**")
 st.sidebar.write(f"当前进度：**{min(st.session_state.current_index, total)}/{total}**")
 
 if st.sidebar.button("🔄 重置当前筛选进度"):
     st.session_state.progress_map[state_key] = {
-        "current_index": 0, "score": 0, "submitted": False, "last_is_correct": None
+        "current_index": 0,
+        "score": 0,
+        "submitted": False,
+        "last_is_correct": None,
     }
-    load_state(state_key)
+    load_state_for_key()
     st.session_state.active_state_key = state_key
     st.rerun()
 
-# No questions
+# ---- 没题直接提示
 if total == 0:
-    st.warning("当前筛选条件下没有题目。请在左侧切换课程/章节/题型。")
+    st.warning("该筛选条件下暂无题目。请在左侧切换课程/章节/题型。")
     st.stop()
 
-
-# =========================
-# Progress bar
-# =========================
-progress = st.session_state.current_index / total if total else 0.0
+# ---- 进度条
+progress = st.session_state.current_index / total
 st.progress(progress)
 
-
 # =========================
-# Finish page
+# 结算页
 # =========================
 if st.session_state.current_index >= total:
-    st.success(f"✅ 已完成本筛选范围全部题目！总分：{st.session_state.score} / {total}")
+    st.success(f"✅ 已完成当前筛选！得分：{st.session_state.score} / {total}")
     st.progress(1.0)
-
-    if st.button("🔄 重新开始（本筛选）", type="primary"):
+    if st.button("🔄 重新开始（当前筛选）", type="primary"):
         st.session_state.current_index = 0
         st.session_state.score = 0
         st.session_state.submitted = False
         st.session_state.last_is_correct = None
-        save_state(state_key)
+        save_current_state()
         st.rerun()
-
     st.stop()
 
-
 # =========================
-# Current question
+# 当前题
 # =========================
 pos = st.session_state.current_index
-q = filtered[pos]
+global_idx = filtered_indices[pos]
+q = active_quiz[global_idx]
 
-course = resolve_course(q)
-chapter = resolve_chapter(q)
-qtype = resolve_qtype(q)
+chapter = get_chapter(q)
+qtype = infer_qtype(q)
 
 st.subheader(f"第 {pos + 1} / {total} 题")
-st.caption(f"课程：{course}｜章节：{chapter}｜题型：{qtype}")
-st.write(q.get("question", "（无题干）"))
-
-options = q.get("options") or []
-answer = q.get("answer", None)
-explanation = q.get("explanation", "")
+st.caption(f"课程：{course_name}  |  章节：{chapter}  |  题型：{qtype}")
+st.write(q.get("question", ""))
 
 disabled = bool(st.session_state.submitted)
 
-# Per-question widget key (critical to avoid session_state conflicts)
-widget_key = f"ans::{state_key}::{pos}"
+# 为每题生成稳定 widget key（避免 “不能修改 session_state” 报错）
+widget_key = f"ans::{course_name}::{global_idx}"
 
 user_answer = None
 
-# =========================
-# Render input widgets
-# =========================
+# -------------------------
+# 单选题
+# -------------------------
 if qtype == "单选题":
-    # ✅ no placeholder, use index=None
+    opts = [PLACEHOLDER] + (q.get("options") or [])
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = PLACEHOLDER
+
     user_answer = st.radio(
         "请选择一个选项：",
-        options=options,
-        index=None,
+        options=opts,
+        index=opts.index(st.session_state[widget_key]) if st.session_state[widget_key] in opts else 0,
         key=widget_key,
         disabled=disabled,
     )
 
+# -------------------------
+# 多选题（关键：用 multiselect）
+# -------------------------
 elif qtype == "多选题":
+    opts = q.get("options") or []
     if widget_key not in st.session_state:
         st.session_state[widget_key] = []
+
     user_answer = st.multiselect(
-        "请选择一个或多个选项：",
-        options=options,
+        "请选择所有正确选项：",
+        options=opts,
+        default=st.session_state[widget_key] if isinstance(st.session_state[widget_key], list) else [],
         key=widget_key,
         disabled=disabled,
     )
 
+# -------------------------
+# 简答/主观题
+# -------------------------
 else:
     if widget_key not in st.session_state:
         st.session_state[widget_key] = ""
-    if qtype in ("填空题", "名词解释"):
-        user_answer = st.text_input("请输入你的答案：", key=widget_key, disabled=disabled)
-    else:
-        user_answer = st.text_area("请输入你的答案：", key=widget_key, height=120, disabled=disabled)
 
+    user_answer = st.text_area("请输入你的答案：", key=widget_key, height=140, disabled=disabled)
 
 # =========================
-# Submit
+# 提交答案
 # =========================
 if not st.session_state.submitted:
     if st.button("✅ 提交答案", type="primary"):
         correct = None
 
         if qtype == "单选题":
-            if user_answer is None:
+            if user_answer == PLACEHOLDER:
                 st.warning("请先选择一个选项再提交。")
                 st.stop()
-            if isinstance(answer, str) and answer.strip():
-                correct = (user_answer == answer)
-            else:
+
+            ans = q.get("answer")
+            if not ans:
                 correct = None
+            else:
+                correct = (normalize_text(user_answer) == normalize_text(ans))
 
         elif qtype == "多选题":
             if not user_answer:
-                st.warning("请至少选择一个选项再提交。")
+                st.warning("请至少选择 1 个选项再提交。")
                 st.stop()
 
-            if isinstance(answer, list):
-                correct = (set(user_answer) == set(answer))
+            ans = q.get("answer")
+            if not ans:
+                correct = None
             else:
-                # 兜底：如果答案是字符串，按分隔符拆分
-                if isinstance(answer, str) and answer.strip():
-                    parts = [p.strip() for p in re.split(r"[;,\s，、]+", answer) if p.strip()]
-                    correct = (set(user_answer) == set(parts))
-                else:
-                    correct = None
+                correct_set = set(map(normalize_text, ans)) if isinstance(ans, list) else set(map(normalize_text, ensure_list(ans)))
+                user_set = set(map(normalize_text, user_answer))
+                correct = (user_set == correct_set)
 
         else:
-            correct = grade_subjective(str(user_answer), str(answer) if answer is not None else "")
+            correct = grade_subjective(user_answer, q.get("answer", ""))
 
         st.session_state.submitted = True
         st.session_state.last_is_correct = correct
@@ -344,12 +344,11 @@ if not st.session_state.submitted:
         if correct is True:
             st.session_state.score += 1
 
-        save_state(state_key)
+        save_current_state()
         st.rerun()
 
-
 # =========================
-# After submit: feedback / explanation / next
+# 提交后：反馈 + 解析 + 下一题
 # =========================
 if st.session_state.submitted:
     correct = st.session_state.last_is_correct
@@ -357,32 +356,28 @@ if st.session_state.submitted:
     if correct is True:
         st.success("回答正确 ✅")
     elif correct is False:
-        # choice questions show the correct answer
-        if qtype in ("单选题", "多选题"):
-            st.error(f"回答错误 ❌，正确答案是：{answer if answer is not None else '（暂无答案）'}")
+        if qtype == "单选题":
+            st.error(f"回答错误 ❌，正确答案是：{q.get('answer', '（暂无答案）')}")
+        elif qtype == "多选题":
+            ans = q.get("answer", [])
+            if isinstance(ans, list):
+                st.error("回答错误 ❌，正确答案是：\n- " + "\n- ".join(ans) if ans else "回答错误 ❌（暂无答案）")
+            else:
+                st.error(f"回答错误 ❌，正确答案是：{ans}")
         else:
             st.error("未匹配到标准答案（主观题为粗略判定，仅供自查）❌")
     else:
         st.warning("本题暂无可自动判定的标准答案，未计分。")
 
     with st.expander("📌 查看解析 / 参考答案", expanded=True):
-        st.write("**参考答案：**", answer if answer is not None else "（暂无答案）")
-        if explanation:
-            st.write("**解析：**")
-            st.write(explanation)
-        else:
-            st.info("（暂无解析）")
-
-        # debug info (optional): show source file
-        st.caption(f"来源题库：{q.get('_source', 'unknown')}")
+        st.info(q.get("explanation", "（暂无解析）"))
 
     if st.button("➡️ 下一题"):
         st.session_state.current_index += 1
         st.session_state.submitted = False
         st.session_state.last_is_correct = None
-        save_state(state_key)
+        save_current_state()
         st.rerun()
 
-
 st.divider()
-st.caption("© 钱靖 • 单页刷题（JSON题库）")
+st.caption("钱靖 • 刷题系统（支持课程/章节筛选）")
