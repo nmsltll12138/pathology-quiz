@@ -11,12 +11,22 @@ import streamlit as st
 
 @st.cache_data
 def load_quiz():
-    p = Path(__file__).parent / "data" / "quiz_all_courses.json"
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
+    base = Path(__file__).parent
+    p1 = base / "data" / "quiz_pdf_all.json"      # 病理学
+    p2 = base / "data" / "quiz_genomics.json"     # 基因组学
+
+    quiz = []
+    if p1.exists():
+        quiz += json.loads(p1.read_text(encoding="utf-8"))
+    if p2.exists():
+        quiz += json.loads(p2.read_text(encoding="utf-8"))
+
+    if not quiz:
+        raise FileNotFoundError("data/ 下没有找到题库 json 文件。")
+
+    return quiz
 
 quiz_data = load_quiz()
-
 
 # -------------------------
 # 第1章 细胞和组织的适应与损伤（15）
@@ -1702,6 +1712,7 @@ if st.session_state.submitted:
 
 st.divider()
 st.caption("钱靖 • 病理学刷题。")
+
 
 
 
