@@ -1,6 +1,7 @@
 import json
 import difflib
 import re
+import random
 from pathlib import Path
 import streamlit as st
 
@@ -148,6 +149,8 @@ chosen_chapter = st.sidebar.selectbox("选择章节", chapter_labels)
 qtype_labels = ["全部", "单选题", "多选题", "简答题"]
 chosen_qtype = st.sidebar.selectbox("题型筛选", qtype_labels)
 
+random_order = st.sidebar.checkbox("随机顺序刷题", value=False)
+
 
 def passes_filter(it: dict) -> bool:
     if chosen_chapter != "全部" and get_chapter(it) != chosen_chapter:
@@ -158,20 +161,28 @@ def passes_filter(it: dict) -> bool:
     return True
 
 
-filtered_indices = [idx for idx, it in enumerate(active_quiz) if passes_filter(it)]
-total = len(filtered_indices)
+raw_filtered_indices = [idx for idx, it in enumerate(active_quiz) if passes_filter(it)]
 
 # 当前筛选状态 key（决定“独立进度”）
-state_key = f"{course_name}::{chosen_chapter}::{chosen_qtype}"
+state_key = f"{course_name}::{chosen_chapter}::{chosen_qtype}::random={random_order}"
 
 
-def save_current_state():
-    st.session_state.progress_map[state_key] = {
+def make_state_payload(key: str) -> dict:
+    data = st.session_state.progress_map.get(key, {})
+    payload = {
         "current_index": st.session_state.current_index,
         "score": st.session_state.score,
         "submitted": st.session_state.submitted,
         "last_is_correct": st.session_state.last_is_correct,
     }
+    ordered_indices = data.get("ordered_indices")
+    if ordered_indices is not None:
+        payload["ordered_indices"] = ordered_indices
+    return payload
+
+
+def save_current_state():
+    st.session_state.progress_map[state_key] = make_state_payload(state_key)
 
 
 def load_state_for_key():
@@ -192,14 +203,26 @@ def load_state_for_key():
 if st.session_state.active_state_key != state_key:
     if st.session_state.active_state_key is not None:
         old_key = st.session_state.active_state_key
-        st.session_state.progress_map[old_key] = {
-            "current_index": st.session_state.current_index,
-            "score": st.session_state.score,
-            "submitted": st.session_state.submitted,
-            "last_is_correct": st.session_state.last_is_correct,
-        }
+        st.session_state.progress_map[old_key] = make_state_payload(old_key)
     load_state_for_key()
     st.session_state.active_state_key = state_key
+
+if random_order:
+    state_data = st.session_state.progress_map.setdefault(state_key, {})
+    ordered_indices = state_data.get("ordered_indices")
+    if (
+        ordered_indices is None
+        or len(ordered_indices) != len(raw_filtered_indices)
+        or set(ordered_indices) != set(raw_filtered_indices)
+    ):
+        ordered_indices = raw_filtered_indices[:]
+        random.shuffle(ordered_indices)
+        state_data["ordered_indices"] = ordered_indices
+    filtered_indices = ordered_indices
+else:
+    filtered_indices = raw_filtered_indices
+
+total = len(filtered_indices)
 
 # ---- 侧边栏：信息与重置
 st.sidebar.markdown("---")
@@ -207,13 +230,30 @@ st.sidebar.write(f"当前题量：**{total}**")
 st.sidebar.write(f"当前得分：**{st.session_state.score}**")
 st.sidebar.write(f"当前进度：**{min(st.session_state.current_index, total)}/{total}**")
 
+if random_order and st.sidebar.button("🎲 重新随机当前题序"):
+    ordered_indices = raw_filtered_indices[:]
+    random.shuffle(ordered_indices)
+    st.session_state.progress_map[state_key] = {
+        "current_index": 0,
+        "score": 0,
+        "submitted": False,
+        "last_is_correct": None,
+        "ordered_indices": ordered_indices,
+    }
+    load_state_for_key()
+    st.session_state.active_state_key = state_key
+    st.rerun()
+
 if st.sidebar.button("🔄 重置当前筛选进度"):
+    ordered_indices = st.session_state.progress_map.get(state_key, {}).get("ordered_indices")
     st.session_state.progress_map[state_key] = {
         "current_index": 0,
         "score": 0,
         "submitted": False,
         "last_is_correct": None,
     }
+    if ordered_indices is not None:
+        st.session_state.progress_map[state_key]["ordered_indices"] = ordered_indices
     load_state_for_key()
     st.session_state.active_state_key = state_key
     st.rerun()
